@@ -54,6 +54,57 @@
   .marker-pin.yellow { background: #ca4; }
   .marker-pin.red { background: #c44; }
   .marker-pin.blue { background: #48c; }
+
+  /* Live Amenities Overlay Styles */
+  .amenity-pin {
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    border: 1.5px solid #fff;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: bold;
+    cursor: pointer;
+    transition: transform 0.2s;
+  }
+  .amenity-pin:hover {
+    transform: scale(1.25);
+    z-index: 1000 !important;
+  }
+  .amenity-pin.toilets { background: #b02a3a; color: #fff; }
+  .amenity-pin.wifi { background: #0d6efd; color: #fff; }
+  .amenity-pin.shops { background: #d97706; color: #fff; }
+  .amenity-pin.water { background: #0caf60; color: #fff; }
+
+  /* Floating "Search this area" button styling */
+  #search-area-btn {
+    position: absolute;
+    top: 15px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1000;
+    background: #1a1a1a;
+    border: 1.5px solid #5a8;
+    color: #8f8;
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: bold;
+    cursor: pointer;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+    display: none;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.2s;
+  }
+  #search-area-btn:hover {
+    background: #222;
+    border-color: #7c9;
+    transform: translateX(-50%) scale(1.05);
+  }
 </style>
 </head>
 <body>
@@ -66,13 +117,21 @@
   <button class="btn active" id="btn-sat" onclick="setLayer('sat')">Satellite</button>
   <button class="btn" id="btn-road" onclick="setLayer('road')">Road</button>
   <button class="btn" id="btn-hybrid" onclick="setLayer('hybrid')">Hybrid</button>
+  <span style="border-left: 1px solid #444; height: 20px; margin: 0 4px;"></span>
+  <button class="btn" id="btn-amenity-toilets" onclick="toggleAmenity('toilets')">🚻 Toilets</button>
+  <button class="btn" id="btn-amenity-wifi" onclick="toggleAmenity('wifi')">☕ Wi-Fi & Food</button>
+  <button class="btn" id="btn-amenity-shops" onclick="toggleAmenity('shops')">🛒 Late Shops</button>
+  <button class="btn" id="btn-amenity-water" onclick="toggleAmenity('water')">💧 Water Taps</button>
+  <span style="border-left: 1px solid #444; height: 20px; margin: 0 4px;"></span>
   <button class="btn" onclick="exportSpots()">Export JSON</button>
   <button class="btn" onclick="importSpots()">Import</button>
   <input id="import-file" type="file" accept=".json" style="display:none" onchange="loadImport(event)"/>
   <button class="btn danger" onclick="clearAll()">Clear All</button>
 </div>
 <div id="main">
-  <div id="map"></div>
+  <div id="map">
+    <button id="search-area-btn" onclick="triggerSearch()">🔍 Search this area</button>
+  </div>
   <div id="sidebar">
     <div id="sv-panel">
       <div id="sv-placeholder"><span>👁</span>Click a pinned spot<br>to open Street View</div>
@@ -128,6 +187,8 @@ function setLayer(name) {
 
 let spots = JSON.parse(localStorage.getItem('spotscout_spots')||'[]');
 let selectedId=null, editingId=null, markers={};
+const enabledAmenities = { toilets: false, wifi: false, shops: false, water: false };
+const amenityLayerGroup = L.layerGroup().addTo(map);
 
 function save() { localStorage.setItem('spotscout_spots', JSON.stringify(spots)); }
 
@@ -274,6 +335,193 @@ function clearAll() {
 }
 
 function setStatus(msg){document.getElementById('statusbar').textContent=msg;}
+
+function toggleAmenity(type) {
+  enabledAmenities[type] = !enabledAmenities[type];
+  document.getElementById(`btn-amenity-${type}`).classList.toggle('active', enabledAmenities[type]);
+  
+  updateSearchButtonVisibility();
+  
+  if (!Object.values(enabledAmenities).some(v => v)) {
+    amenityLayerGroup.clearLayers();
+  }
+}
+
+function updateSearchButtonVisibility() {
+  const btn = document.getElementById('search-area-btn');
+  const anyActive = Object.values(enabledAmenities).some(v => v);
+  btn.style.display = anyActive ? 'flex' : 'none';
+  if (anyActive) {
+    btn.style.borderColor = '#5a8';
+    btn.style.color = '#8f8';
+  }
+}
+
+map.on('moveend', () => {
+  if (Object.values(enabledAmenities).some(v => v)) {
+    updateSearchButtonVisibility();
+    const btn = document.getElementById('search-area-btn');
+    btn.style.borderColor = '#ca4';
+    btn.style.color = '#fa0';
+  }
+});
+
+async function triggerSearch() {
+  const zoom = map.getZoom();
+  if (zoom < 13) {
+    setStatus('Zoom in closer (level 13+) to search amenities.');
+    return;
+  }
+  
+  const btn = document.getElementById('search-area-btn');
+  btn.innerHTML = '⏳ Searching...';
+  btn.style.borderColor = '#444';
+  btn.style.color = '#888';
+  
+  setStatus('Querying Overpass API for active amenities...');
+  
+  const bounds = map.getBounds();
+  const south = bounds.getSouth();
+  const west = bounds.getWest();
+  const north = bounds.getNorth();
+  const east = bounds.getEast();
+  const bbox = `${south},${west},${north},${east}`;
+  
+  let queries = [];
+  if (enabledAmenities.toilets) {
+    queries.push(`node["amenity"="toilets"](${bbox});way["amenity"="toilets"](${bbox});`);
+  }
+  if (enabledAmenities.wifi) {
+    queries.push(`node["amenity"="cafe"](${bbox});node["amenity"="fast_food"](${bbox});`);
+  }
+  if (enabledAmenities.shops) {
+    queries.push(`node["shop"="supermarket"](${bbox});node["shop"="convenience"](${bbox});node["amenity"="fuel"](${bbox});`);
+  }
+  if (enabledAmenities.water) {
+    queries.push(`node["amenity"="drinking_water"](${bbox});`);
+  }
+  
+  if (queries.length === 0) {
+    btn.innerHTML = '🔍 Search this area';
+    updateSearchButtonVisibility();
+    return;
+  }
+  
+  const overpassQuery = `
+    [out:json][timeout:25];
+    (
+      ${queries.join('\n')}
+    );
+    out body center;
+  `;
+  
+  const url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(overpassQuery)}`;
+  
+  try {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('Overpass server error');
+    const data = await response.json();
+    
+    renderAmenities(data.elements);
+    setStatus(`Amenities search complete. Found ${data.elements.length} item(s).`);
+    
+    btn.innerHTML = '🔍 Search this area';
+    btn.style.borderColor = '#5a8';
+    btn.style.color = '#8f8';
+  } catch (err) {
+    console.error(err);
+    setStatus('Failed to fetch live amenities from Overpass API.');
+    btn.innerHTML = '❌ Search failed — Retry';
+    btn.style.borderColor = '#c44';
+    btn.style.color = '#f88';
+  }
+}
+
+function renderAmenities(elements) {
+  amenityLayerGroup.clearLayers();
+  
+  elements.forEach(el => {
+    const lat = el.lat || (el.center && el.center.lat);
+    const lng = el.lon || (el.center && el.center.lng) || (el.center && el.center.lon);
+    if (!lat || !lng) return;
+    
+    const tags = el.tags || {};
+    let type = '';
+    let emoji = '';
+    let name = tags.name || 'Unnamed';
+    
+    if (tags.amenity === 'toilets') {
+      type = 'toilets';
+      emoji = '🚻';
+      name = tags.name || 'Public Washroom';
+    } else if (tags.amenity === 'cafe' || tags.amenity === 'fast_food') {
+      type = 'wifi';
+      emoji = '☕';
+    } else if (tags.shop === 'supermarket' || tags.shop === 'convenience' || tags.amenity === 'fuel') {
+      type = 'shops';
+      if (tags.amenity === 'fuel') {
+        emoji = '⛽';
+        name = tags.name || 'Fuel Station';
+      } else {
+        emoji = '🛒';
+      }
+    } else if (tags.amenity === 'drinking_water') {
+      type = 'water';
+      emoji = '💧';
+      name = tags.name || 'Drinking Water Tap';
+    }
+    
+    if (!type) return;
+    
+    let popupContent = `
+      <div style="font-family: system-ui, sans-serif; font-size: 12px; color: #eee; min-width: 180px;">
+        <div style="font-weight: bold; font-size: 13px; margin-bottom: 5px; color: #aef; display: flex; align-items: center; gap: 4px;">
+          <span>${emoji}</span> <span>${name}</span>
+        </div>
+        <div style="color: #888; font-size: 9px; text-transform: uppercase; margin-bottom: 8px; border-bottom: 1px solid #333; padding-bottom: 4px;">Live Amenity Overlay</div>
+    `;
+    
+    if (tags.opening_hours) {
+      popupContent += `<div style="margin-bottom: 4px;"><b>⏰ Hours:</b> <span style="color: #8f8;">${tags.opening_hours}</span></div>`;
+    }
+    if (tags.wheelchair) {
+      popupContent += `<div style="margin-bottom: 4px;"><b>♿ Wheelchair:</b> ${tags.wheelchair}</div>`;
+    }
+    if (tags.operator) {
+      popupContent += `<div style="margin-bottom: 4px;"><b>🏢 Operator:</b> ${tags.operator}</div>`;
+    }
+    if (tags.fee) {
+      popupContent += `<div style="margin-bottom: 4px;"><b>💵 Fee:</b> ${tags.fee}</div>`;
+    }
+    
+    popupContent += `
+        <hr style="border: 0; border-top: 1px solid #333; margin: 8px 0 6px 0;">
+        <div style="display: flex; gap: 6px;">
+          <button class="btn" style="padding: 2px 6px; font-size: 10px;" onclick="map.flyTo([${lat}, ${lng}], 17)">📍 Focus</button>
+          <button class="btn" style="padding: 2px 6px; font-size: 10px;" onclick="openSVAmenity(${lat}, ${lng})">👁 StreetView</button>
+        </div>
+      </div>
+    `;
+    
+    const icon = L.divIcon({
+      html: `<div class="amenity-pin ${type}">${emoji}</div>`,
+      iconSize: [18, 18],
+      iconAnchor: [9, 9],
+      popupAnchor: [0, -9],
+      className: ''
+    });
+    
+    const marker = L.marker([lat, lng], { icon }).bindPopup(popupContent);
+    amenityLayerGroup.addLayer(marker);
+  });
+}
+
+function openSVAmenity(lat, lng) {
+  const frame = document.getElementById('sv-frame'), ph = document.getElementById('sv-placeholder');
+  frame.src = `https://maps.google.com/maps?q=${lat},${lng}&layer=c&cbll=${lat},${lng}&cbp=12,0,0,0,0&output=svembed`;
+  frame.style.display = 'block'; ph.style.display = 'none';
+  map.flyTo([lat, lng], 17);
+}
 
 renderSpots();
 setStatus(`${spots.length} spot(s) loaded. Click map to pin. Hover for coordinates.`);
