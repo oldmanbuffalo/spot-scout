@@ -105,6 +105,10 @@
     border-color: #7c9;
     transform: translateX(-50%) scale(1.05);
   }
+  .field-status { font-size: 10px; padding: 2px 5px; border-radius: 3px; font-weight: 600; display: inline-block; margin-left: 4px; }
+  .field-status.visited { background: #1a3a1a; color: #5c5; border: 1px solid #3a6a3a; }
+  .field-status.knocked { background: #3a1a1a; color: #c55; border: 1px solid #6a3a3a; }
+  .field-status.untested { background: #222; color: #666; border: 1px solid #444; }
 </style>
 </head>
 <body>
@@ -124,6 +128,7 @@
   <button class="btn" id="btn-amenity-water" onclick="toggleAmenity('water')">💧 Water Taps</button>
   <span style="border-left: 1px solid #444; height: 20px; margin: 0 4px;"></span>
   <button class="btn" onclick="exportSpots()">Export JSON</button>
+  <button class="btn" onclick="exportKML()">Export KML</button>
   <button class="btn" onclick="importSpots()">Import</button>
   <input id="import-file" type="file" accept=".json" style="display:none" onchange="loadImport(event)"/>
   <button class="btn danger" onclick="clearAll()">Clear All</button>
@@ -194,12 +199,17 @@ function save() { localStorage.setItem('spotscout_spots', JSON.stringify(spots))
 
 function ratingColor(r) { return {'🟢':'green','🟡':'yellow','🔴':'red','🔵':'blue'}[r]||'blue'; }
 
-function makeIcon(rating) {
-  return L.divIcon({html:`<div class="marker-pin ${ratingColor(rating)}"></div>`,iconSize:[22,22],iconAnchor:[11,22],popupAnchor:[0,-22],className:''});
+function makeIcon(rating, fieldStatus) {
+  const badge = fieldStatus === 'visited'
+    ? `<div style="position:absolute;top:-5px;right:-5px;background:#4c4;color:#111;border-radius:50%;width:12px;height:12px;font-size:9px;line-height:12px;text-align:center;font-weight:bold;border:1px solid #fff;">✓</div>`
+    : fieldStatus === 'knocked'
+    ? `<div style="position:absolute;top:-5px;right:-5px;background:#c44;color:#fff;border-radius:50%;width:12px;height:12px;font-size:9px;line-height:12px;text-align:center;font-weight:bold;border:1px solid #fff;">✗</div>`
+    : '';
+  return L.divIcon({html:`<div style="position:relative;width:22px;height:22px;"><div class="marker-pin ${ratingColor(rating)}"></div>${badge}</div>`,iconSize:[28,28],iconAnchor:[11,22],popupAnchor:[0,-22],className:''});
 }
 
 function addMarker(spot) {
-  const m = L.marker([spot.lat, spot.lng], {icon:makeIcon(spot.rating)}).addTo(map);
+  const m = L.marker([spot.lat, spot.lng], {icon:makeIcon(spot.rating, spot.fieldStatus)}).addTo(map);
   m.on('click', () => selectSpot(spot.id));
   markers[spot.id]=m;
 }
@@ -215,13 +225,16 @@ function renderSpots() {
     const card = document.createElement('div');
     card.className='spot-card'+(s.id===selectedId?' selected':'');
     card.id='card-'+s.id;
+    const fs = s.fieldStatus || 'untested';
+    const fsLabel = fs === 'visited' ? '✓ Visited' : fs === 'knocked' ? '✗ Knocked' : '? Untested';
     card.innerHTML=`
       <div class="spot-card-header"><span class="spot-name">${s.name||'Unnamed spot'}</span><span class="spot-rating">${s.rating||'🔵'}</span></div>
-      <div class="spot-coords">${s.lat.toFixed(5)}, ${s.lng.toFixed(5)}</div>
+      <div class="spot-coords">${s.lat.toFixed(5)}, ${s.lng.toFixed(5)}<span class="field-status ${fs}">${fsLabel}</span></div>
       ${s.notes?`<div class="spot-notes">${s.notes}</div>`:''}
       <div class="spot-actions">
         <button class="btn" onclick="flyTo('${s.id}')">📍 Fly</button>
         <button class="btn" onclick="openSV('${s.id}')">👁 StreetView</button>
+        <button class="btn" onclick="cycleFieldStatus('${s.id}')">🔖 Status</button>
         <button class="btn" onclick="editSpot('${s.id}')">✏️ Edit</button>
         <button class="btn danger" onclick="deleteSpot('${s.id}')">🗑</button>
       </div>`;
@@ -274,6 +287,45 @@ function deleteSpot(id) {
   if(selectedId===id) selectedId=null;
   if(editingId===id){editingId=null;document.getElementById('edit-panel').style.display='none';}
   save(); renderSpots();
+}
+
+function cycleFieldStatus(id) {
+  const s = spots.find(x => x.id === id); if (!s) return;
+  const states = [undefined, 'visited', 'knocked'];
+  const cur = states.indexOf(s.fieldStatus);
+  s.fieldStatus = states[(cur + 1) % states.length];
+  save(); renderSpots(); selectSpot(id);
+  const label = s.fieldStatus === 'visited' ? '✓ Visited' : s.fieldStatus === 'knocked' ? '✗ Knocked' : '? Untested';
+  setStatus(`${s.name||'Spot'}: marked as ${label}.`);
+}
+
+function escXml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function exportKML() {
+  const kmlColor = {'🟢':'ff44aa44','🟡':'ff44ccaa','🔴':'ff4444cc','🔵':'ffcc8844'};
+  const placemarks = spots.map(s => {
+    const color = kmlColor[s.rating] || 'ffaaaaaa';
+    const fsNote = s.fieldStatus === 'visited' ? 'Field status: ✓ Visited' : s.fieldStatus === 'knocked' ? 'Field status: ✗ Knocked' : '';
+    const desc = [s.notes, fsNote].filter(Boolean).join('&#10;');
+    return `  <Placemark>
+    <name>${escXml(s.name||'Unnamed spot')}</name>
+    <description>${escXml ? desc : ''}</description>
+    <Style><IconStyle><color>${color}</color><scale>1.1</scale><Icon><href>http://maps.google.com/mapfiles/kml/paddle/wht-blank.png</href></Icon></IconStyle></Style>
+    <Point><coordinates>${s.lng},${s.lat},0</coordinates></Point>
+  </Placemark>`;
+  }).join('\n');
+  const kml = `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+  <name>Spot Scout — ${new Date().toISOString().slice(0,10)}</name>
+${placemarks}
+</Document>
+</kml>`;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([kml], {type:'application/vnd.google-earth.kml+xml'}));
+  a.download = `spotscout_${new Date().toISOString().slice(0,10)}.kml`;
+  a.click();
+  setStatus(`Exported ${spots.length} spot(s) to KML — import into Google My Maps.`);
 }
 
 map.on('click', e => {

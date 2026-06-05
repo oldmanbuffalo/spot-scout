@@ -26,6 +26,23 @@ client = genai.Client(vertexai=True, project=GCP_PROJECT, location=GCP_LOCATION)
 # ── Overpass query ────────────────────────────────────────────────────────────
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
+# Retailers/chains with documented or well-known overnight parking tolerance
+OVERNIGHT_CHAINS = {
+    "walmart":        ("Walmart",              "explicitly allows overnight parking by policy"),
+    "wal-mart":       ("Walmart",              "explicitly allows overnight parking by policy"),
+    "cracker barrel": ("Cracker Barrel",       "explicitly welcomes RV/car overnight parking"),
+    "flying j":       ("Flying J",             "truck stop — overnight parking standard"),
+    "pilot":          ("Pilot Travel Center",  "truck stop — overnight parking standard"),
+    "loves":          ("Love's Travel Stop",   "truck stop — overnight parking standard"),
+    "love's":         ("Love's Travel Stop",   "truck stop — overnight parking standard"),
+    "cabela":         ("Cabela's",             "large lot, commonly allows overnight stays"),
+    "bass pro":       ("Bass Pro Shops",       "large lot, commonly allows overnight stays"),
+    "camping world":  ("Camping World",        "RV-focused, overnight usually fine"),
+    "sam's club":     ("Sam's Club",           "some locations allow overnight parking"),
+    "costco":         ("Costco",               "some locations allow overnight parking"),
+    "menards":        ("Menards",              "some locations allow overnight parking"),
+}
+
 def build_overpass_query(lat, lon, radius_m=2000):
     """
     Pull features useful for overnight parking scouting:
@@ -44,11 +61,13 @@ def build_overpass_query(lat, lon, radius_m=2000):
 [out:json][timeout:60][maxsize:16000000];
 (
   way["highway"~"^(service|track|unclassified|tertiary|road)$"]{bb};
-  nwr["amenity"~"^(parking|rest_area|truck_stop|fuel|police|hospital)$"]{bb};
+  nwr["amenity"~"^(parking|rest_area|truck_stop|fuel|police|hospital|fast_food|toilets|drinking_water)$"]{bb};
+  nwr["shop"~"^(convenience|supermarket)$"]{bb};
   nwr["landuse"~"^(industrial|commercial|retail|forest|farmyard)$"]{bb};
   nwr["natural"~"^(wood|scrub|grassland|heath)$"]{bb};
   nwr["tourism"~"^(camp_site|caravan_site|picnic_site|viewpoint)$"]{bb};
   nwr["leisure"~"^(marina|slipway|nature_reserve|park)$"]{bb};
+  node["highway"="street_lamp"]{bb};
 );
 out body center qt;
 """
@@ -68,7 +87,8 @@ def query_overpass(lat, lon, radius_m=2000):
 def summarise_osm(osm_data, center_lat, center_lon):
     elements = osm_data.get("elements", [])
 
-    roads, parking, landuse, natural, amenities, tourism, leisure = [], [], [], [], [], [], []
+    roads, parking, landuse, natural, amenities, tourism, leisure, facilities, lamps = [], [], [], [], [], [], [], [], []
+    chain_spots = []
 
     for el in elements:
         tags = el.get("tags", {})
@@ -135,12 +155,32 @@ def summarise_osm(osm_data, center_lat, center_lon):
         elif amenity in ("fuel","hospital","police","bus_station"):
             amenities.append({"dist_m": int(dist), "type": amenity, "name": name,
                               "lat": clat, "lon": clon})
+        elif amenity in ("fast_food","toilets","drinking_water") or \
+             tags.get("shop","") in ("convenience","supermarket"):
+            ftype = amenity or tags.get("shop","")
+            facilities.append({
+                "dist_m": int(dist), "type": ftype, "name": name,
+                "lat": clat, "lon": clon,
+                "opening_hours": tags.get("opening_hours","unknown")
+            })
         elif boundary in ("protected_area","national_park","provincial_park"):
             natural.append({"dist_m": int(dist), "type": boundary, "name": name,
                             "lat": clat, "lon": clon})
         elif waterway in ("boat_ramp","slipway"):
             leisure.append({"dist_m": int(dist), "type": waterway, "name": name,
                             "lat": clat, "lon": clon, "access": access})
+        elif hw == "street_lamp":
+            lamps.append({"lat": clat, "lon": clon, "dist_m": int(dist)})
+
+        # Chain-store name match (runs for every element regardless of above)
+        name_lc = name.lower()
+        for key, (chain_name, policy) in OVERNIGHT_CHAINS.items():
+            if key in name_lc:
+                chain_spots.append({
+                    "dist_m": int(dist), "chain": chain_name,
+                    "policy": policy, "lat": clat, "lon": clon
+                })
+                break
 
     # Sort by distance, cap lists to keep prompt size manageable
     roads    = sorted(roads,    key=lambda x: x["dist_m"])[:35]
@@ -150,6 +190,9 @@ def summarise_osm(osm_data, center_lat, center_lon):
     tourism  = sorted(tourism,  key=lambda x: x["dist_m"])[:15]
     leisure  = sorted(leisure,  key=lambda x: x["dist_m"])[:15]
     amenities= sorted(amenities,key=lambda x: x["dist_m"])[:10]
+    facilities= sorted(facilities,key=lambda x: x["dist_m"])[:15]
+    lamps      = sorted(lamps,      key=lambda x: x["dist_m"])[:100]
+    chain_spots= sorted(chain_spots,key=lambda x: x["dist_m"])
 
     return {
         "center": {"lat": center_lat, "lon": center_lon},
@@ -160,6 +203,9 @@ def summarise_osm(osm_data, center_lat, center_lon):
         "tourism_sites": tourism,
         "leisure_areas": leisure,
         "nearby_amenities": amenities,
+        "facilities_24h": facilities,
+        "street_lamps": lamps,
+        "overnight_chains": chain_spots,
         "total_elements": len(elements)
     }
 
@@ -171,6 +217,13 @@ def haversine(lat1, lon1, lat2, lon2):
     return 2*R*math.asin(math.sqrt(a))
 
 # ── Gemini analysis ───────────────────────────────────────────────────────────
+MODE_PREFIXES = {
+    "stealth":     "PRIORITY MODE — STEALTH: rank concealment above all. Prefer deep cover, unpaved tracks, forest edges, industrial dead-ends. Deprioritize facilities distance.",
+    "convenience": "PRIORITY MODE — CONVENIENCE: rank proximity to 24h facilities (fuel, fast food, toilets, water) above stealth. Accept visible spots if bathroom/water is walking distance.",
+    "safe":        "PRIORITY MODE — SAFETY: rank ambient light and nearby 24h human activity above stealth. Avoid complete isolation. Some visibility is acceptable for security.",
+    "default":     "",
+}
+
 SYSTEM_PROMPT = """You are an expert at finding discreet overnight vehicle parking spots for someone living in their car.
 Given OpenStreetMap geographic data around a location, identify the best candidate spots.
 
@@ -180,9 +233,17 @@ For each spot consider:
 - PRACTICALITY: flat enough to sleep, no time restrictions, legal or low-enforcement risk
 - COVER: trees, buildings, terrain that shields the vehicle
 - PROXIMITY: distance from the search center
+- FACILITIES: proximity to 24h fuel stations, fast food, toilets, or convenience stores
+  (critical for car living — bathroom access, water, charging)
+- LIGHTING: use the street_lamps list — high lamp density within 50m = high nighttime exposure;
+  prefer spots where the nearest lamp cluster is 100m+ away
+- CHAINS: overnight_chains in the data are explicitly overnight-friendly lots;
+  always recommend any within range as top candidates
 
 Good spot types: industrial/commercial lots at night, forest service roads, church parking lots,
 dead-end service roads, large retail back lots, rest areas, truck stops, campgrounds.
+Priority bonus: spots within 1km of a 24h fuel station or fast food (bathroom + water access).
+TOP PRIORITY: any overnight_chains entry — these are gold-standard spots; list them first.
 
 Bad spot types: residential streets (complaints), high-foot-traffic areas, anywhere with
 clearly posted no overnight parking, near police stations.
@@ -199,9 +260,30 @@ Each spot must have exactly these fields:
   "created": "<ISO datetime string>"
 }"""
 
-def ask_gemini(summary):
-    prompt = f"""Analyze this OpenStreetMap data and identify the best overnight parking spots.
+def _build_feedback_block(feedback):
+    if not feedback:
+        return ""
+    knocked = [s for s in feedback if s.get("fieldStatus") == "knocked"]
+    visited = [s for s in feedback if s.get("fieldStatus") == "visited"]
+    lines = []
+    if knocked:
+        lines.append("PREVIOUSLY REJECTED SPOTS — avoid similar terrain/context:")
+        for s in knocked[:10]:
+            lng = s.get("lng", s.get("lon", 0))
+            lines.append(f"  ✗ {s.get('name','?')} ({s['lat']:.5f},{lng:.5f}): {s.get('notes','')[:120]}")
+    if visited:
+        lines.append("PREVIOUSLY SUCCESSFUL SPOTS — similar contexts are good:")
+        for s in visited[:6]:
+            lng = s.get("lng", s.get("lon", 0))
+            lines.append(f"  ✓ {s.get('name','?')} ({s['lat']:.5f},{lng:.5f})")
+    return ("\n".join(lines) + "\n") if lines else ""
 
+def ask_gemini(summary, mode="default", feedback=None):
+    mode_line = MODE_PREFIXES.get(mode, "")
+    feedback_block = _build_feedback_block(feedback)
+    prompt = f"""Analyze this OpenStreetMap data and identify the best overnight parking spots.
+{mode_line}
+{feedback_block}
 Data:
 {json.dumps(summary, indent=2)}
 
@@ -281,6 +363,13 @@ def main():
                         help="Search radius in meters (default: 5000)")
     parser.add_argument("--output", default=None,
                         help="Output JSON file path (default: spots_<location>.json)")
+    parser.add_argument("--append", action="store_true",
+                        help="Merge new spots into existing output file instead of overwriting")
+    parser.add_argument("--feedback", default=None, metavar="FILE",
+                        help="JSON spots file with field-tested results to improve recommendations")
+    parser.add_argument("--mode", default="default",
+                        choices=["default","stealth","convenience","safe"],
+                        help="Scout priority mode (default: balanced)")
     args = parser.parse_args()
 
     if not args.location:
@@ -306,10 +395,28 @@ def main():
           f"{len(summary['landuse_zones'])} landuse, "
           f"{len(summary['natural_cover'])} natural, "
           f"{len(summary['tourism_sites'])} tourism, "
-          f"{len(summary['leisure_areas'])} leisure")
+          f"{len(summary['leisure_areas'])} leisure, "
+          f"{len(summary['facilities_24h'])} facilities, "
+          f"{len(summary['street_lamps'])} lamps, "
+          f"{len(summary['overnight_chains'])} chain spots")
+
+    # Load feedback if provided
+    feedback_spots = None
+    if args.feedback:
+        try:
+            with open(args.feedback) as fb:
+                feedback_spots = json.load(fb)
+            knocked_n = sum(1 for s in feedback_spots if s.get("fieldStatus") == "knocked")
+            visited_n = sum(1 for s in feedback_spots if s.get("fieldStatus") == "visited")
+            print(f"Feedback loaded: {knocked_n} knocked, {visited_n} visited spots.")
+        except Exception as e:
+            print(f"Warning: could not load feedback file: {e}")
+
+    if args.mode != "default":
+        print(f"Mode: {args.mode}")
 
     print("\nAsking Gemini to analyze and score candidate spots...")
-    spots = ask_gemini(summary)
+    spots = ask_gemini(summary, mode=args.mode, feedback=feedback_spots)
     print(f"\nGemini identified {len(spots)} candidate spots:\n")
 
     for i, s in enumerate(spots, 1):
@@ -323,6 +430,23 @@ def main():
         safe = display[:30].replace(" ", "_").replace(",", "").replace("/", "-")
         out_path = os.path.join(os.path.dirname(__file__),
                                 f"spots_{safe}.json")
+
+    # Append mode: merge with existing file, dedup by 150m proximity
+    if args.append and os.path.exists(out_path):
+        with open(out_path) as f:
+            existing = json.load(f)
+        merged = list(existing)
+        for s in spots:
+            too_close = any(
+                haversine(s["lat"], s.get("lng", s.get("lon", 0)),
+                          e["lat"], e.get("lng", e.get("lon", 0))) < 150
+                for e in merged
+            )
+            if not too_close:
+                merged.append(s)
+        added = len(merged) - len(existing)
+        spots = merged
+        print(f"\nAppend mode: {added} new spot(s) added ({len(existing)} existing → {len(spots)} total).")
 
     with open(out_path, "w") as f:
         json.dump(spots, f, indent=2)
