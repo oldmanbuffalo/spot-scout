@@ -78,6 +78,8 @@
   .amenity-pin.wifi { background: #0d6efd; color: #fff; }
   .amenity-pin.shops { background: #d97706; color: #fff; }
   .amenity-pin.water { background: #0caf60; color: #fff; }
+  .amenity-pin.services { background: #7c3aed; color: #fff; }
+  .geo-dot { width: 16px; height: 16px; border-radius: 50%; background: #2196f3; border: 2.5px solid #fff; box-shadow: 0 0 10px rgba(33,150,243,0.9); }
 
   /* Floating "Search this area" button styling */
   #search-area-btn {
@@ -126,6 +128,10 @@
   <button class="btn" id="btn-amenity-wifi" onclick="toggleAmenity('wifi')">☕ Wi-Fi & Food</button>
   <button class="btn" id="btn-amenity-shops" onclick="toggleAmenity('shops')">🛒 Late Shops</button>
   <button class="btn" id="btn-amenity-water" onclick="toggleAmenity('water')">💧 Water Taps</button>
+  <button class="btn" id="btn-amenity-services" onclick="toggleAmenity('services')">🏛 Services</button>
+  <span style="border-left: 1px solid #444; height: 20px; margin: 0 4px;"></span>
+  <button class="btn" id="btn-locate" onclick="toggleLocate()">📡 Locate</button>
+  <button class="btn" id="btn-nearest" onclick="goNearestSpot()">🟢 Nearest</button>
   <span style="border-left: 1px solid #444; height: 20px; margin: 0 4px;"></span>
   <button class="btn" onclick="exportSpots()">Export JSON</button>
   <button class="btn" onclick="exportKML()">Export KML</button>
@@ -192,8 +198,9 @@ function setLayer(name) {
 
 let spots = JSON.parse(localStorage.getItem('spotscout_spots')||'[]');
 let selectedId=null, editingId=null, markers={};
-const enabledAmenities = { toilets: false, wifi: false, shops: false, water: false };
+const enabledAmenities = { toilets: false, wifi: false, shops: false, water: false, services: false };
 const amenityLayerGroup = L.layerGroup().addTo(map);
+let geoWatchId=null, geoMarker=null, geoCircle=null, geoPos=null, nearestLine=null;
 
 function save() { localStorage.setItem('spotscout_spots', JSON.stringify(spots)); }
 
@@ -234,6 +241,7 @@ function renderSpots() {
       <div class="spot-actions">
         <button class="btn" onclick="flyTo('${s.id}')">📍 Fly</button>
         <button class="btn" onclick="openSV('${s.id}')">👁 StreetView</button>
+        <button class="btn" onclick="navTo('${s.id}')">🧭 Nav</button>
         <button class="btn" onclick="cycleFieldStatus('${s.id}')">🔖 Status</button>
         <button class="btn" onclick="editSpot('${s.id}')">✏️ Edit</button>
         <button class="btn danger" onclick="deleteSpot('${s.id}')">🗑</button>
@@ -452,6 +460,9 @@ async function triggerSearch() {
   if (enabledAmenities.water) {
     queries.push(`node["amenity"="drinking_water"](${bbox});`);
   }
+  if (enabledAmenities.services) {
+    queries.push(`nwr["amenity"="social_facility"](${bbox});nwr["amenity"="library"](${bbox});nwr["leisure"="fitness_centre"](${bbox});nwr["amenity"="place_of_worship"](${bbox});`);
+  }
   
   if (queries.length === 0) {
     btn.innerHTML = '🔍 Search this area';
@@ -521,6 +532,22 @@ function renderAmenities(elements) {
       type = 'water';
       emoji = '💧';
       name = tags.name || 'Drinking Water Tap';
+    } else if (tags.amenity === 'social_facility') {
+      type = 'services';
+      emoji = '🏠';
+      name = tags.name || (tags.social_facility ? tags.social_facility.replace(/_/g, ' ') : 'Social Facility');
+    } else if (tags.amenity === 'library') {
+      type = 'services';
+      emoji = '📚';
+      name = tags.name || 'Library';
+    } else if (tags.leisure === 'fitness_centre') {
+      type = 'services';
+      emoji = '🚿';
+      name = tags.name || 'Gym / Fitness Centre';
+    } else if (tags.amenity === 'place_of_worship') {
+      type = 'services';
+      emoji = '⛪';
+      name = tags.name || 'Place of Worship';
     }
     
     if (!type) return;
@@ -544,6 +571,9 @@ function renderAmenities(elements) {
     }
     if (tags.fee) {
       popupContent += `<div style="margin-bottom: 4px;"><b>💵 Fee:</b> ${tags.fee}</div>`;
+    }
+    if (tags.social_facility) {
+      popupContent += `<div style="margin-bottom: 4px;"><b>🏠 Service:</b> ${tags.social_facility.replace(/_/g, ' ')}${tags['social_facility:for'] ? ' (' + tags['social_facility:for'] + ')' : ''}</div>`;
     }
     
     popupContent += `
@@ -573,6 +603,70 @@ function openSVAmenity(lat, lng) {
   frame.src = `https://maps.google.com/maps?q=${lat},${lng}&layer=c&cbll=${lat},${lng}&cbp=12,0,0,0,0&output=svembed`;
   frame.style.display = 'block'; ph.style.display = 'none';
   map.flyTo([lat, lng], 17);
+}
+
+// ── Geolocation & navigation ──────────────────────────────────────────────
+
+function toggleLocate() {
+  const btn = document.getElementById('btn-locate');
+  if (geoWatchId !== null) {
+    navigator.geolocation.clearWatch(geoWatchId); geoWatchId = null;
+    if (geoMarker) { map.removeLayer(geoMarker); geoMarker = null; }
+    if (geoCircle) { map.removeLayer(geoCircle); geoCircle = null; }
+    if (nearestLine) { map.removeLayer(nearestLine); nearestLine = null; }
+    geoPos = null; btn.classList.remove('active');
+    setStatus('Location tracking off.');
+    return;
+  }
+  if (!navigator.geolocation) { setStatus('Geolocation not supported by this browser.'); return; }
+  btn.classList.add('active');
+  setStatus('Acquiring GPS fix…');
+  geoWatchId = navigator.geolocation.watchPosition(p => {
+    geoPos = [p.coords.latitude, p.coords.longitude];
+    const acc = p.coords.accuracy;
+    if (!geoMarker) {
+      geoMarker = L.marker(geoPos, { icon: L.divIcon({ html: '<div class="geo-dot"></div>', iconSize: [16,16], iconAnchor: [8,8], className: '' }), zIndexOffset: 900 }).addTo(map);
+      geoCircle = L.circle(geoPos, { radius: acc, color: '#48f', weight: 1, fillOpacity: 0.08 }).addTo(map);
+      map.flyTo(geoPos, 15);
+    } else {
+      geoMarker.setLatLng(geoPos);
+      geoCircle.setLatLng(geoPos); geoCircle.setRadius(acc);
+    }
+    setStatus(`GPS: ${geoPos[0].toFixed(5)}, ${geoPos[1].toFixed(5)} (±${Math.round(acc)}m)`);
+  }, e => {
+    setStatus('GPS error: ' + e.message + (location.protocol === 'file:' ? ' (some browsers block GPS on local files — try Firefox or host the page)' : ''));
+    btn.classList.remove('active'); geoWatchId = null;
+  }, { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 });
+}
+
+function distM(lat1, lon1, lat2, lon2) {
+  const R = 6371000, p = Math.PI / 180;
+  const a = Math.sin((lat2-lat1)*p/2)**2 + Math.cos(lat1*p)*Math.cos(lat2*p)*Math.sin((lon2-lon1)*p/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+function goNearestSpot() {
+  const from = geoPos || [map.getCenter().lat, map.getCenter().lng];
+  const green  = spots.filter(s => s.rating === '🟢' && s.fieldStatus !== 'knocked');
+  const yellow = spots.filter(s => s.rating === '🟡' && s.fieldStatus !== 'knocked');
+  const cands = green.length ? green : yellow;
+  if (!cands.length) { setStatus('No 🟢/🟡 spots available — import or pin some first.'); return; }
+  let best = null, bd = Infinity;
+  cands.forEach(s => { const d = distM(from[0], from[1], s.lat, s.lng); if (d < bd) { bd = d; best = s; } });
+  if (nearestLine) map.removeLayer(nearestLine);
+  nearestLine = L.polyline([from, [best.lat, best.lng]], { color: '#4a8', dashArray: '6 6', weight: 2 }).addTo(map);
+  map.fitBounds(nearestLine.getBounds(), { padding: [60, 60] });
+  selectSpot(best.id);
+  setStatus(`Nearest ${best.rating} spot: ${best.name || 'Unnamed'} — ${(bd/1000).toFixed(1)} km ${geoPos ? 'from your position' : 'from map center (enable 📡 Locate for GPS)'}`);
+}
+
+function navTo(id) {
+  const s = spots.find(x => x.id === id); if (!s) return;
+  const isAndroid = /Android/i.test(navigator.userAgent);
+  const url = isAndroid
+    ? `geo:${s.lat},${s.lng}?q=${s.lat},${s.lng}(${encodeURIComponent(s.name || 'Spot')})`
+    : `https://www.google.com/maps/dir/?api=1&destination=${s.lat},${s.lng}`;
+  window.open(url, isAndroid ? '_self' : '_blank');
 }
 
 renderSpots();

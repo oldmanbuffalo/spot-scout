@@ -62,6 +62,8 @@ def build_overpass_query(lat, lon, radius_m=2000):
 (
   way["highway"~"^(service|track|unclassified|tertiary|road)$"]{bb};
   nwr["amenity"~"^(parking|rest_area|truck_stop|fuel|police|hospital|fast_food|toilets|drinking_water)$"]{bb};
+  nwr["amenity"~"^(social_facility|library|place_of_worship)$"]{bb};
+  nwr["leisure"="fitness_centre"]{bb};
   nwr["shop"~"^(convenience|supermarket)$"]{bb};
   nwr["landuse"~"^(industrial|commercial|retail|forest|farmyard)$"]{bb};
   nwr["natural"~"^(wood|scrub|grassland|heath)$"]{bb};
@@ -88,7 +90,7 @@ def summarise_osm(osm_data, center_lat, center_lon):
     elements = osm_data.get("elements", [])
 
     roads, parking, landuse, natural, amenities, tourism, leisure, facilities, lamps = [], [], [], [], [], [], [], [], []
-    chain_spots = []
+    chain_spots, services = [], []
 
     for el in elements:
         tags = el.get("tags", {})
@@ -135,6 +137,15 @@ def summarise_osm(osm_data, center_lat, center_lon):
                 "fee": tags.get("fee","unknown"),
                 "maxstay": tags.get("maxstay","unknown"),
                 "opening_hours": tags.get("opening_hours","unknown")
+            })
+        elif amenity in ("social_facility", "library", "place_of_worship") or \
+             leisure_tag == "fitness_centre":
+            stype = "fitness_centre" if leisure_tag == "fitness_centre" else amenity
+            services.append({
+                "dist_m": int(dist), "type": stype, "name": name,
+                "lat": clat, "lon": clon,
+                "detail": tags.get("social_facility", ""),
+                "opening_hours": tags.get("opening_hours", "unknown")
             })
         elif lu:
             landuse.append({"dist_m": int(dist), "type": lu, "name": name,
@@ -193,6 +204,7 @@ def summarise_osm(osm_data, center_lat, center_lon):
     facilities= sorted(facilities,key=lambda x: x["dist_m"])[:15]
     lamps      = sorted(lamps,      key=lambda x: x["dist_m"])[:100]
     chain_spots= sorted(chain_spots,key=lambda x: x["dist_m"])
+    services   = sorted(services,   key=lambda x: x["dist_m"])[:15]
 
     return {
         "center": {"lat": center_lat, "lon": center_lon},
@@ -206,6 +218,7 @@ def summarise_osm(osm_data, center_lat, center_lon):
         "facilities_24h": facilities,
         "street_lamps": lamps,
         "overnight_chains": chain_spots,
+        "support_services": services,
         "total_elements": len(elements)
     }
 
@@ -239,6 +252,10 @@ For each spot consider:
   prefer spots where the nearest lamp cluster is 100m+ away
 - CHAINS: overnight_chains in the data are explicitly overnight-friendly lots;
   always recommend any within range as top candidates
+- SERVICES: support_services lists libraries (daytime base: warmth, Wi-Fi, bathroom,
+  charging), fitness centres (showers), social facilities (food banks, shelters, meals),
+  and places of worship (many run meal programs). Spots within easy reach of these
+  get a practicality bonus; mention the nearest relevant service in the notes.
 
 Good spot types: industrial/commercial lots at night, forest service roads, church parking lots,
 dead-end service roads, large retail back lots, rest areas, truck stops, campgrounds.
@@ -340,6 +357,84 @@ Return a JSON array of up to 6 candidate spots as specified."""
     except Exception as e:
         raise SystemExit(f"Failed to parse Gemini response: {e}\nRaw text: {text}")
 
+# ── Satellite image verification ──────────────────────────────────────────────
+SAT_EXPORT_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export"
+
+VERIFY_PROMPT = """You are visually verifying a candidate overnight parking spot for someone
+living in their car. The attached satellite photo is centered on the candidate spot
+(roughly {span}m across).
+
+Assess from the imagery only:
+- COVER: tree canopy, buildings, or terrain that would shield a parked car
+- SIGHTLINES: is the spot visible from main roads or houses?
+- SURFACE: paved lot, gravel, grass, or undrivable?
+- ACCESS: visible gates, barriers, fences, or a clear entrance?
+- CONTEXT: residential windows overlooking it? commercial/industrial? isolated?
+
+Prior assessment of this spot: {prior_rating} — {prior_notes}
+
+Return ONLY valid JSON, no markdown:
+{{
+  "verdict": "confirm" | "upgrade" | "downgrade",
+  "rating": "🟢" | "🟡" | "🔴",
+  "visual_notes": "2 sentences max: what the imagery shows that matters"
+}}"""
+
+def fetch_sat_image(lat, lon, span_m=250, size=512):
+    """Fetch a satellite image centered on (lat, lon) from Esri World Imagery (free, no key)."""
+    dlat = span_m / 2 / 111320
+    dlon = span_m / 2 / (111320 * math.cos(math.radians(lat)))
+    params = urllib.parse.urlencode({
+        "bbox": f"{lon-dlon},{lat-dlat},{lon+dlon},{lat+dlat}",
+        "bboxSR": "4326", "imageSR": "3857",
+        "size": f"{size},{size}", "format": "jpg", "f": "image"
+    })
+    req = urllib.request.Request(f"{SAT_EXPORT_URL}?{params}",
+                                  headers={"User-Agent": "SpotScout/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+def verify_spots(spots, span_m=250):
+    """Visually verify each spot against satellite imagery via Gemini multimodal."""
+    print("\nVerifying spots against satellite imagery...")
+    for i, s in enumerate(spots, 1):
+        lat, lng = s["lat"], s.get("lng", s.get("lon"))
+        try:
+            img = fetch_sat_image(lat, lng, span_m=span_m)
+        except Exception as e:
+            print(f"  {i}. {s.get('name','?')}: image fetch failed ({e}) — skipped")
+            continue
+        prompt = VERIFY_PROMPT.format(span=span_m,
+                                      prior_rating=s.get("rating", "🔵"),
+                                      prior_notes=s.get("notes", "")[:200])
+        try:
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=[types.Part.from_bytes(data=img, mime_type="image/jpeg"), prompt],
+                config=types.GenerateContentConfig(
+                    temperature=0.2, max_output_tokens=1024,
+                    response_mime_type="application/json"
+                )
+            )
+            result = json.loads(response.text.strip())
+        except Exception as e:
+            print(f"  {i}. {s.get('name','?')}: Gemini verification failed ({e}) — skipped")
+            continue
+        old = s.get("rating", "🔵")
+        new = result.get("rating", old)
+        notes = result.get("visual_notes", "").strip()
+        s["rating"] = new
+        s["verified"] = True
+        s["visual_notes"] = notes
+        if notes:
+            s["notes"] = (s.get("notes", "").rstrip() + f" [SAT✓] {notes}").strip()
+        arrow = "=" if old == new else f"{old}→{new}"
+        print(f"  {i}. {result.get('verdict','?'):9s} {arrow}  {s.get('name','?')}")
+        if notes:
+            print(f"     {notes}")
+        time.sleep(1)  # gentle on imagery server + model quota
+    return spots
+
 # ── Geocode address → lat/lon ─────────────────────────────────────────────────
 def geocode(query):
     url = ("https://nominatim.openstreetmap.org/search?format=json&limit=1&q="
@@ -352,106 +447,4 @@ def geocode(query):
     r = results[0]
     return float(r["lat"]), float(r["lon"]), r["display_name"]
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser(
-        description="Scout overnight parking spots using OSM + Gemini AI"
-    )
-    parser.add_argument("location", nargs="?",
-                        help='Address or place name, e.g. "Austin, TX" or "40.7128,-74.0060"')
-    parser.add_argument("--radius", type=int, default=5000,
-                        help="Search radius in meters (default: 5000)")
-    parser.add_argument("--output", default=None,
-                        help="Output JSON file path (default: spots_<location>.json)")
-    parser.add_argument("--append", action="store_true",
-                        help="Merge new spots into existing output file instead of overwriting")
-    parser.add_argument("--feedback", default=None, metavar="FILE",
-                        help="JSON spots file with field-tested results to improve recommendations")
-    parser.add_argument("--mode", default="default",
-                        choices=["default","stealth","convenience","safe"],
-                        help="Scout priority mode (default: balanced)")
-    args = parser.parse_args()
-
-    if not args.location:
-        args.location = input("Enter location (address or lat,lon): ").strip()
-
-    # Parse lat/lon directly or geocode
-    try:
-        parts = args.location.split(",")
-        lat, lon = float(parts[0]), float(parts[1])
-        display = args.location
-    except (ValueError, IndexError):
-        print(f"Geocoding: {args.location}...")
-        lat, lon, display = geocode(args.location)
-        print(f"Found: {display}")
-        print(f"Coordinates: {lat}, {lon}")
-
-    print(f"\nQuerying OpenStreetMap within {args.radius}m of ({lat:.4f}, {lon:.4f})...")
-    osm_data = query_overpass(lat, lon, args.radius)
-    summary = summarise_osm(osm_data, lat, lon)
-    print(f"Found {summary['total_elements']} OSM elements — "
-          f"{len(summary['roads'])} roads, "
-          f"{len(summary['parking_nodes'])} parking, "
-          f"{len(summary['landuse_zones'])} landuse, "
-          f"{len(summary['natural_cover'])} natural, "
-          f"{len(summary['tourism_sites'])} tourism, "
-          f"{len(summary['leisure_areas'])} leisure, "
-          f"{len(summary['facilities_24h'])} facilities, "
-          f"{len(summary['street_lamps'])} lamps, "
-          f"{len(summary['overnight_chains'])} chain spots")
-
-    # Load feedback if provided
-    feedback_spots = None
-    if args.feedback:
-        try:
-            with open(args.feedback) as fb:
-                feedback_spots = json.load(fb)
-            knocked_n = sum(1 for s in feedback_spots if s.get("fieldStatus") == "knocked")
-            visited_n = sum(1 for s in feedback_spots if s.get("fieldStatus") == "visited")
-            print(f"Feedback loaded: {knocked_n} knocked, {visited_n} visited spots.")
-        except Exception as e:
-            print(f"Warning: could not load feedback file: {e}")
-
-    if args.mode != "default":
-        print(f"Mode: {args.mode}")
-
-    print("\nAsking Gemini to analyze and score candidate spots...")
-    spots = ask_gemini(summary, mode=args.mode, feedback=feedback_spots)
-    print(f"\nGemini identified {len(spots)} candidate spots:\n")
-
-    for i, s in enumerate(spots, 1):
-        print(f"  {i}. {s['rating']} {s['name']}")
-        print(f"     {s['lat']:.5f}, {s['lng']:.5f}")
-        print(f"     {s['notes']}\n")
-
-    # Output file
-    out_path = args.output
-    if not out_path:
-        safe = display[:30].replace(" ", "_").replace(",", "").replace("/", "-")
-        out_path = os.path.join(os.path.dirname(__file__),
-                                f"spots_{safe}.json")
-
-    # Append mode: merge with existing file, dedup by 150m proximity
-    if args.append and os.path.exists(out_path):
-        with open(out_path) as f:
-            existing = json.load(f)
-        merged = list(existing)
-        for s in spots:
-            too_close = any(
-                haversine(s["lat"], s.get("lng", s.get("lon", 0)),
-                          e["lat"], e.get("lng", e.get("lon", 0))) < 150
-                for e in merged
-            )
-            if not too_close:
-                merged.append(s)
-        added = len(merged) - len(existing)
-        spots = merged
-        print(f"\nAppend mode: {added} new spot(s) added ({len(existing)} existing → {len(spots)} total).")
-
-    with open(out_path, "w") as f:
-        json.dump(spots, f, indent=2)
-    print(f"Saved to: {out_path}")
-    print("\nImport this file into spot-scout.html using the 'Import' button.")
-
-if __name__ == "__main__":
-    main()
+# ── Main ──�

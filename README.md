@@ -42,6 +42,15 @@ py scout.py "42.4183,-82.0898" --radius 1500
 
 `--radius` is in meters. 2000m (2km) is a good default. Go up to 5000 for rural areas with fewer features.
 
+**Useful flags:**
+
+| Flag | What it does |
+|---|---|
+| `--verify` | After scoring, Gemini visually inspects a satellite photo of each spot (cover, sightlines, gates) and adjusts the rating. Adds `[SAT✓]` notes. ~6 extra image calls per run. |
+| `--mode stealth\|convenience\|safe` | Changes scoring priorities |
+| `--append` | Merge new spots into an existing JSON instead of overwriting |
+| `--feedback <file>` | Feed field-tested results back into recommendations |
+
 **Output:** saves a `spots_<location>.json` file in the same folder.
 
 ---
@@ -58,6 +67,14 @@ py scout.py "42.4183,-82.0898" --radius 1500
    - 🔵 Blue — unknown/needs scouting
 5. Click a pin → **👁 StreetView** to see ground-level view
 6. Click **✏️ Edit** to add your own notes after visiting
+7. **🧭 Nav** on a spot card opens turn-by-turn navigation (Google Maps app on Android)
+
+**Overlays (top bar):** 🚻 Toilets, ☕ Wi-Fi & Food, 🛒 Late Shops, 💧 Water Taps, and
+**🏛 Services** — food banks, shelters, libraries (warmth/Wi-Fi/charging), gyms (showers),
+places of worship. Toggle one or more, then click **🔍 Search this area**.
+
+**GPS:** **📡 Locate** shows your live position (blue dot). **🟢 Nearest** flies to the
+closest good spot from your position (falls back to 🟡, skips ✗ knocked spots).
 
 ---
 
@@ -66,37 +83,4 @@ py scout.py "42.4183,-82.0898" --radius 1500
 You can also drop pins manually without running the scout:
 - Click anywhere on the map to place a pin
 - Fill in name, rating, notes in the sidebar
-- Pins are saved automatically in your browser (localStorage)
-- Use **Export JSON** to back them up
-
----
-
-## Troubleshooting
-
-| Error | Fix |
-|---|---|
-| `ModuleNotFoundError: google.genai` | Run `py -m pip install google-genai` |
-| `google.auth.exceptions.DefaultCredentialsError` | Run `gcloud auth application-default login` |
-| `404 model not found` | Model name changed — update `MODEL` in scout.py to a current name |
-| `429 quota exceeded` | Credits depleted — check console.cloud.google.com/billing |
-| `0 OSM elements found` | Try a larger `--radius` or check the location spelling |
-
----
-
-## Key Files
-
-| File | Purpose |
-|---|---|
-| `scout.py` | AI-powered spot finder script |
-| `spot-scout.html` | Interactive map viewer |
-| `.env` | API key storage (do not share) |
-| `spots_*.json` | Scout output files — import into map |
-
----
-
-## GCP Project Info
-
-- **Project:** `claude-memory-202605`
-- **Model:** `gemini-2.5-flash` via Vertex AI
-- **Region:** `us-central1`
-- **Billing account:** `01A5BA-F23820-78F6F0` (My Billing Account)
+- Pins are saved automatically in your browse
