@@ -426,7 +426,7 @@ def run_agent(lat, lon, radius_m=2000, mode="default", feedback=None):
         "no prose — using the schema from your instructions."
     )
 
-    contents = [types.Content(role="user", parts=[types.Part.from_text(initial_msg)])]
+    contents = [types.Content(role="user", parts=[types.Part.from_text(text=initial_msg)])]
     config   = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         tools=[_TOOLS],
